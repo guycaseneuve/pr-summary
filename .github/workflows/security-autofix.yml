@@ -645,28 +645,28 @@ jobs:
             '${{ github.run_id }}' >> "$COMMENT_FILE"
           
           printf '### ✅ Auto-Fix Applied Successfully\n\n' >> "$COMMENT_FILE"
-          printf '- **npm audit fix**: %s passes completed\n' "$PASSES" >> "$COMMENT_FILE"
-          printf '- **Critical vulnerabilities fixed**: %s\n' "$FIX_C" >> "$COMMENT_FILE"
-          printf '- **High vulnerabilities fixed**: %s\n' "$FIX_H" >> "$COMMENT_FILE"
-          printf '- **Remaining critical**: %s\n' "$POST_C" >> "$COMMENT_FILE"
-          printf '- **Remaining high**: %s\n\n' "$POST_H" >> "$COMMENT_FILE"
+          printf -- '- **npm audit fix**: %s passes completed\n' "$PASSES" >> "$COMMENT_FILE"
+          printf -- '- **Critical vulnerabilities fixed**: %s\n' "$FIX_C" >> "$COMMENT_FILE"
+          printf -- '- **High vulnerabilities fixed**: %s\n' "$FIX_H" >> "$COMMENT_FILE"
+          printf -- '- **Remaining critical**: %s\n' "$POST_C" >> "$COMMENT_FILE"
+          printf -- '- **Remaining high**: %s\n\n' "$POST_H" >> "$COMMENT_FILE"
           
           printf '### 🧪 Build & Test Status\n\n' >> "$COMMENT_FILE"
           
           if [ "$BUILD_STATUS" = "passed" ]; then
-            printf '- ✅ **Build**: Passed\n' >> "$COMMENT_FILE"
+            printf -- '- ✅ **Build**: Passed\n' >> "$COMMENT_FILE"
           elif [ "$BUILD_STATUS" = "failed" ]; then
-            printf '- ❌ **Build**: Failed (see PR for error details)\n' >> "$COMMENT_FILE"
+            printf -- '- ❌ **Build**: Failed (see PR for error details)\n' >> "$COMMENT_FILE"
           else
-            printf '- ⚠️ **Build**: Unknown\n' >> "$COMMENT_FILE"
+            printf -- '- ⚠️ **Build**: Unknown\n' >> "$COMMENT_FILE"
           fi
           
           if [ "$TEST_STATUS" = "passed" ]; then
-            printf '- ✅ **Tests**: Passed\n' >> "$COMMENT_FILE"
+            printf -- '- ✅ **Tests**: Passed\n' >> "$COMMENT_FILE"
           elif [ "$TEST_STATUS" = "failed" ]; then
-            printf '- ❌ **Tests**: Failed (see PR for error details)\n' >> "$COMMENT_FILE"
+            printf -- '- ❌ **Tests**: Failed (see PR for error details)\n' >> "$COMMENT_FILE"
           else
-            printf '- ⚠️ **Tests**: Unknown\n' >> "$COMMENT_FILE"
+            printf -- '- ⚠️ **Tests**: Unknown\n' >> "$COMMENT_FILE"
           fi
           
           printf '\n' >> "$COMMENT_FILE"
@@ -786,26 +786,26 @@ jobs:
           # Build & Test Status Section
           if [ "$BUILD_STATUS" = "passed" ] && [ "$TEST_STATUS" = "passed" ]; then
             printf '### ✅ Build & Test Status\n\n' >> "$PR_BODY_FILE"
-            printf '- ✅ **Build**: Passed\n' >> "$PR_BODY_FILE"
-            printf '- ✅ **Tests**: Passed\n\n' >> "$PR_BODY_FILE"
+            printf -- '- ✅ **Build**: Passed\n' >> "$PR_BODY_FILE"
+            printf -- '- ✅ **Tests**: Passed\n\n' >> "$PR_BODY_FILE"
             printf '> **This PR is ready for review and merge.**\n\n' >> "$PR_BODY_FILE"
           else
             printf '### ⚠️ Build & Test Status — **REQUIRES MANUAL REVIEW**\n\n' >> "$PR_BODY_FILE"
             
             if [ "$BUILD_STATUS" = "failed" ]; then
-              printf '- ❌ **Build**: Failed ([view logs](%s/actions/runs/%s))\n' \
+              printf -- '- ❌ **Build**: Failed ([view logs](%s/actions/runs/%s))\n' \
                 '${{ github.server_url }}/${{ github.repository }}' \
                 '${{ github.run_id }}' >> "$PR_BODY_FILE"
             else
-              printf '- ✅ **Build**: Passed\n' >> "$PR_BODY_FILE"
+              printf -- '- ✅ **Build**: Passed\n' >> "$PR_BODY_FILE"
             fi
             
             if [ "$TEST_STATUS" = "failed" ]; then
-              printf '- ❌ **Tests**: Failed ([view logs](%s/actions/runs/%s))\n\n' \
+              printf -- '- ❌ **Tests**: Failed ([view logs](%s/actions/runs/%s))\n\n' \
                 '${{ github.server_url }}/${{ github.repository }}' \
                 '${{ github.run_id }}' >> "$PR_BODY_FILE"
             else
-              printf '- ✅ **Tests**: Passed\n\n' >> "$PR_BODY_FILE"
+              printf -- '- ✅ **Tests**: Passed\n\n' >> "$PR_BODY_FILE"
             fi
             
             printf '> ⚠️ **The auto-fix may have introduced errors. Please review the error details below before merging.**\n\n' >> "$PR_BODY_FILE"
@@ -861,8 +861,8 @@ jobs:
 
           printf -- '---\n\n' >> "$PR_BODY_FILE"
           printf '### Changes Applied\n\n' >> "$PR_BODY_FILE"
-          printf '- `npm audit fix --force` (%s passes) — upgraded vulnerable dependencies\n' "${PASSES}" >> "$PR_BODY_FILE"
-          printf '- `eslint --fix` — corrected code style issues\n\n' >> "$PR_BODY_FILE"
+          printf -- '- `npm audit fix --force` (%s passes) — upgraded vulnerable dependencies\n' "${PASSES}" >> "$PR_BODY_FILE"
+          printf -- '- `eslint --fix` — corrected code style issues\n\n' >> "$PR_BODY_FILE"
           
           printf '### Dependency Vulnerability Delta\n\n' >> "$PR_BODY_FILE"
           printf '| Severity | Before | After | Fixed |\n' >> "$PR_BODY_FILE"
