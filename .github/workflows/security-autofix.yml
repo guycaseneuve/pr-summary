@@ -781,7 +781,7 @@ jobs:
             '${{ github.server_url }}/${{ github.repository }}' \
             '${{ github.run_id }}' >> "$PR_BODY_FILE"
           printf '**Target branch:** `%s`\n\n' "${TARGET_BRANCH}" >> "$PR_BODY_FILE"
-          printf '---\n\n' >> "$PR_BODY_FILE"
+          printf -- '---\n\n' >> "$PR_BODY_FILE"
 
           # Build & Test Status Section
           if [ "$BUILD_STATUS" = "passed" ] && [ "$TEST_STATUS" = "passed" ]; then
@@ -859,7 +859,7 @@ jobs:
             fi
           fi
 
-          printf '---\n\n' >> "$PR_BODY_FILE"
+          printf -- '---\n\n' >> "$PR_BODY_FILE"
           printf '### Changes Applied\n\n' >> "$PR_BODY_FILE"
           printf '- `npm audit fix --force` (%s passes) — upgraded vulnerable dependencies\n' "${PASSES}" >> "$PR_BODY_FILE"
           printf '- `eslint --fix` — corrected code style issues\n\n' >> "$PR_BODY_FILE"
@@ -883,7 +883,7 @@ jobs:
             printf '%s\n\n' "$CODEQL_SECTION" >> "$PR_BODY_FILE"
           fi
 
-          printf '---\n\n' >> "$PR_BODY_FILE"
+          printf -- '---\n\n' >> "$PR_BODY_FILE"
 
           # Add AI security report if available
           if [ -f results/security-report.md ]; then
