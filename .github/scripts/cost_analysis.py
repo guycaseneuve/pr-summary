@@ -156,7 +156,7 @@ def generate_table_3(usage_data: dict = None) -> str:
         variance_input = ((input_tokens - TYPICAL_SCAN["input_tokens"]) / TYPICAL_SCAN["input_tokens"] * 100)
         variance_output = ((output_tokens - TYPICAL_SCAN["output_tokens"]) / TYPICAL_SCAN["output_tokens"] * 100)
         table += f"""
-**Data Source:** Actual usage from current workflow run
+**Per Scan Usage (Current Run):**
 - Model: {model_used}
 - Actual: {input_tokens:,} input / {output_tokens:,} output tokens
 - Estimated: {TYPICAL_SCAN["input_tokens"]:,} input / {TYPICAL_SCAN["output_tokens"]:,} output tokens
@@ -230,15 +230,46 @@ def generate_cost_analysis(usage_data: dict = None) -> str:
     if usage_data and usage_data.get("data_source") == "actual_current_run":
         data_indicator = " (Using Actual Token Data)"
     
+    # Create summary box if actual data available
+    summary_box = ""
+    if usage_data and usage_data.get("data_source") == "actual_current_run":
+        input_tokens = usage_data["input_tokens"]
+        output_tokens = usage_data["output_tokens"]
+        total_tokens = input_tokens + output_tokens
+        model_used = usage_data.get("model", "unknown")
+        
+        # Calculate actual vs estimated
+        est_input = TYPICAL_SCAN["input_tokens"]
+        est_output = TYPICAL_SCAN["output_tokens"]
+        est_total = est_input + est_output
+        variance_input = ((input_tokens - est_input) / est_input * 100)
+        variance_output = ((output_tokens - est_output) / est_output * 100)
+        
+        # Calculate costs
+        actual_cost = calculate_cost(input_tokens, output_tokens, model_used.split("/")[-1] if "/" in model_used else model_used)
+        est_cost = calculate_cost(est_input, est_output, model_used.split("/")[-1] if "/" in model_used else model_used)
+        
+        summary_box = f"""---
+
+## Current Run Token Usage (Single Scan)
+
+**Model:** {model_used}  
+**Actual Tokens:** {input_tokens:,} input / {output_tokens:,} output ({total_tokens:,} total)  
+**Estimated:** {est_input:,} input / {est_output:,} output ({est_total:,} total)  
+**Variance:** {variance_input:+.1f}% input, {variance_output:+.1f}% output  
+**Actual Cost:** ${actual_cost:.4f} (vs ${est_cost:.4f} estimated)  
+
+---
+
+"""
+    
     markdown = f"""# Security Scanning Cost Analysis{data_indicator}
 
 **Generated:** {timestamp}
 
 This report compares costs across security scanning tiers, AI models, scan frequencies, and repository sizes to help optimize the security automation workflow.
 
----
-
-{generate_table_1()}
+{summary_box}{generate_table_1()}
 
 ---
 
