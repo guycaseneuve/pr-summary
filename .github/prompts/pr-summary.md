@@ -2,6 +2,20 @@
 
 Generate a PR description and changelog fragment for the pull request below.
 
+## Repo Context
+
+This repository contains:
+- **demo-app/**: An Express.js application (Node.js) with intentional security vulnerabilities for testing
+- **.github/workflows/**: CI/CD pipelines (CodeQL, security-autofix, PR summary, dependabot-autofix, incident postmortem)
+- **.github/prompts/**: AI prompt templates for each workflow
+- **.github/skills/**: AI skill/persona definitions for each workflow
+- **.github/scripts/**: Utility scripts (aggregate_findings.py)
+
+Key conventions:
+- Security fixes go to `security/autofix-*` branches
+- Commit messages follow conventional commits: `feat:`, `fix:`, `security:`, `deps:`
+- PRs targeting `main` trigger CodeQL + PR summary
+
 ## Instructions
 
 1. **Extract the CMT/JIRA ID** from the source branch name using the rules defined in SKILL.md.

@@ -9,5 +9,23 @@ updates:
     directory: "/demo-app"
     schedule:
       interval: "weekly"
-    # Disable automatic PRs — we handle dependency scanning in security-autofix.yml
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
+    labels:
+      - "dependabot"
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    # Group minor/patch updates together to reduce PR noise
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependabot"
+      - "ci"

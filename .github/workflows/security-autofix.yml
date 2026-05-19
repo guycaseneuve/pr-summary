@@ -616,6 +616,7 @@ jobs:
           # Ensure labels exist
           gh label create "security" --repo "$REPO" --color "D93F0B" --description "Security-related" 2>/dev/null || true
           gh label create "automated" --repo "$REPO" --color "0E8A16" --description "Automated PR" 2>/dev/null || true
+          gh label create "needs-security-review" --repo "$REPO" --color "FBCA04" --description "Requires security team review before merge" 2>/dev/null || true
 
           if [ -n "$EXISTING_PR" ]; then
             # Update existing PR body
@@ -625,15 +626,16 @@ jobs:
               --title "security: auto-fix vulnerabilities (run ${{ github.run_id }})"
             echo "✅ Existing PR #${EXISTING_PR} updated with new fixes"
           else
-            # Create new PR
+            # Create new PR with review gate label
             gh pr create \
               --repo "$REPO" \
               --base "$TARGET_BRANCH" \
               --head "$BRANCH" \
               --title "security: auto-fix vulnerabilities (run ${{ github.run_id }})" \
               --body "$PR_BODY" \
-              --label "security,automated"
+              --label "security,automated,needs-security-review"
             echo "✅ Auto-fix PR created targeting ${TARGET_BRANCH}"
+            echo "⚠️  PR requires 'needs-security-review' label removal + approval before merge"
           fi
 
       - name: Upload audit delta artifact

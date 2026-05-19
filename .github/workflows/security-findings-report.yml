@@ -1,0 +1,183 @@
+# Aggregate Security Findings Report
+# Runs weekly (separate from autofix) to produce a consolidated security dashboard.
+# Uploads the report as an artifact and creates/updates a tracking issue.
+#
+# Prerequisites:
+#   1. GH_PAT_TOKEN secret with scopes: repo, security_events
+
+name: Security Findings Report
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"  # Monday 8am UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: read
+  issues: write
+
+jobs:
+  aggregate-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run CodeQL scan
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          source-root: demo-app
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: results
+          upload: always
+
+      - name: Run npm audit
+        working-directory: demo-app
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          npm install --ignore-scripts 2>/dev/null || true
+
+          npm audit --json > /tmp/npm-audit-raw.json 2>/dev/null || true
+
+          jq '[
+            .vulnerabilities | to_entries[] |
+            {
+              name: .key,
+              severity: .value.severity,
+              range: .value.range,
+              fix_available: (.value.fixAvailable // false),
+              via: [.value.via[] | if type == "object" then {title: .title, url: .url, severity: .severity} else {title: .} end]
+            }
+          ]' /tmp/npm-audit-raw.json > /tmp/npm-audit-parsed.json 2>/dev/null || echo "[]" > /tmp/npm-audit-parsed.json
+
+          jq '[.[] | {
+            security_advisory: {
+              summary: (.via[0].title // "Vulnerability in \(.name)"),
+              severity: .severity,
+              identifiers: [.via[] | select(.url) | {type: "CVE", value: (.url | split("/") | last)}],
+              description: (.via[0].title // "")
+            },
+            security_vulnerability: {
+              severity: .severity,
+              package: {name: .name, ecosystem: "npm"},
+              vulnerable_version_range: .range,
+              first_patched_version: (if .fix_available then {identifier: "latest"} else null end)
+            },
+            state: "open",
+            dependency: {
+              package: {name: .name, ecosystem: "npm"},
+              manifest_path: "demo-app/package.json"
+            }
+          }]' /tmp/npm-audit-parsed.json > ../results/dependabot.json 2>/dev/null || echo "[]" > ../results/dependabot.json
+
+      - name: Run aggregate script
+        id: aggregate
+        run: |
+          set -euo pipefail
+
+          SARIF_FILE=$(find results -name "*.sarif" -type f | head -1)
+          DEPENDABOT_FILE="results/dependabot.json"
+
+          SARIF_ARG=""
+          if [ -n "$SARIF_FILE" ]; then
+            SARIF_ARG="--sarif $SARIF_FILE"
+          fi
+
+          DEP_ARG=""
+          if [ -f "$DEPENDABOT_FILE" ]; then
+            DEP_ARG="--dependabot $DEPENDABOT_FILE"
+          fi
+
+          python .github/scripts/aggregate_findings.py \
+            $SARIF_ARG \
+            $DEP_ARG \
+            --output results/aggregated-findings.json
+
+          TOTAL=$(jq '.summary.total' results/aggregated-findings.json)
+          CRITICAL=$(jq '.summary.critical' results/aggregated-findings.json)
+          HIGH=$(jq '.summary.high' results/aggregated-findings.json)
+          MEDIUM=$(jq '.summary.medium' results/aggregated-findings.json)
+          LOW=$(jq '.summary.low' results/aggregated-findings.json)
+
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "critical=$CRITICAL" >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH" >> "$GITHUB_OUTPUT"
+          echo "medium=$MEDIUM" >> "$GITHUB_OUTPUT"
+          echo "low=$LOW" >> "$GITHUB_OUTPUT"
+
+      - name: Create/update tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          TOTAL: ${{ steps.aggregate.outputs.total }}
+          CRITICAL: ${{ steps.aggregate.outputs.critical }}
+          HIGH: ${{ steps.aggregate.outputs.high }}
+          MEDIUM: ${{ steps.aggregate.outputs.medium }}
+          LOW: ${{ steps.aggregate.outputs.low }}
+        run: |
+          set -euo pipefail
+
+          SCAN_DATE=$(date -u +"%Y-%m-%d")
+
+          # Ensure labels exist
+          gh label create "security-report" --repo "$REPO" --color "1D76DB" --description "Weekly security report" 2>/dev/null || true
+
+          # Check for existing open tracking issue
+          EXISTING=$(gh issue list --repo "$REPO" --label "security-report" --state open --json number -q '.[0].number' 2>/dev/null || echo "")
+
+          BODY="## 📊 Weekly Security Findings Report — ${SCAN_DATE}
+
+          | Severity | Count |
+          |----------|-------|
+          | 🔴 Critical | ${CRITICAL} |
+          | 🟠 High | ${HIGH} |
+          | 🟡 Medium | ${MEDIUM} |
+          | 🔵 Low | ${LOW} |
+          | **Total** | **${TOTAL}** |
+
+          **Workflow Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+
+          <details><summary>Full findings JSON</summary>
+
+          \`\`\`json
+          $(cat results/aggregated-findings.json | jq '.' | head -200)
+          \`\`\`
+
+          </details>"
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+            echo "✅ Updated existing tracking issue #${EXISTING}"
+          else
+            gh issue create \
+              --repo "$REPO" \
+              --title "📊 Security Findings Tracker (auto-updated weekly)" \
+              --body "$BODY" \
+              --label "security-report"
+            echo "✅ Created new tracking issue"
+          fi
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-security-report
+          path: results/aggregated-findings.json
+          retention-days: 90

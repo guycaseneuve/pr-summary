@@ -1,0 +1,231 @@
+# Incident Postmortem Pipeline
+# Triggers on workflow failure in production environments or manually via workflow_dispatch.
+# Collects logs, correlates with recent commits/PRs, generates a draft postmortem via AI.
+#
+# Prerequisites:
+#   1. GH_PAT_TOKEN secret with scopes: repo, workflow, actions:read
+#   2. (Optional) SLACK_WEBHOOK_URL for notifications
+
+name: Incident Postmortem
+
+on:
+  workflow_run:
+    workflows: ["Security Autofix", "CodeQL Advanced"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Failed workflow run ID to analyze"
+        required: true
+        type: string
+      environment:
+        description: "Environment where failure occurred"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - prod
+          - staging
+          - qa
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  generate-postmortem:
+    # Only run if the triggering workflow failed, or if manually dispatched
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect workflow run context
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RUN_ID="${{ inputs.run_id }}"
+            ENVIRONMENT="${{ inputs.environment }}"
+          else
+            RUN_ID="${{ github.event.workflow_run.id }}"
+            ENVIRONMENT="prod"
+          fi
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
+          # Fetch workflow run details
+          gh api "/repos/${REPO}/actions/runs/${RUN_ID}" > /tmp/run_details.json
+
+          # Fetch failed job logs (last 5000 chars per job)
+          gh api "/repos/${REPO}/actions/runs/${RUN_ID}/jobs" > /tmp/run_jobs.json
+
+          FAILED_JOBS=$(jq -r '.jobs[] | select(.conclusion == "failure") | .name' /tmp/run_jobs.json)
+          echo "Failed jobs: $FAILED_JOBS"
+
+          # Get recent commits on the branch
+          BRANCH=$(jq -r '.head_branch' /tmp/run_details.json)
+          gh api "/repos/${REPO}/commits?sha=${BRANCH}&per_page=10" > /tmp/recent_commits.json
+
+          # Get recent merged PRs
+          gh pr list --repo "$REPO" --state merged --limit 5 --json number,title,author,mergedAt,headRefName > /tmp/recent_prs.json
+
+          # Write context for AI
+          jq '{
+            run_id: .id,
+            workflow: .name,
+            status: .conclusion,
+            branch: .head_branch,
+            triggered_by: .triggering_actor.login,
+            created_at: .created_at,
+            updated_at: .updated_at,
+            run_url: .html_url
+          }' /tmp/run_details.json > /tmp/run_summary.json
+
+      - name: Generate postmortem via AI
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          MODEL: "openai/gpt-4o-mini"
+          REPO: ${{ github.repository }}
+          ENVIRONMENT: ${{ steps.context.outputs.environment }}
+        run: |
+          set -euo pipefail
+
+          # Load skill as system prompt
+          SKILL_FILE=".github/skills/incident-postmortem.md"
+          if [ -f "$SKILL_FILE" ]; then
+            SYSTEM_PROMPT=$(cat "$SKILL_FILE")
+          else
+            SYSTEM_PROMPT="You are an SRE writing an incident postmortem. Analyze the failure and produce a structured postmortem."
+          fi
+
+          # Load prompt template
+          PROMPT_FILE=".github/prompts/incident-postmortem.md"
+          PROMPT_TEMPLATE=""
+          if [ -f "$PROMPT_FILE" ]; then
+            PROMPT_TEMPLATE=$(cat "$PROMPT_FILE")
+          fi
+
+          RUN_SUMMARY=$(cat /tmp/run_summary.json)
+          FAILED_JOBS=$(jq -r '.jobs[] | select(.conclusion == "failure") | "- \(.name): \(.steps[] | select(.conclusion == "failure") | .name) (failed)"' /tmp/run_jobs.json 2>/dev/null || echo "No job details available")
+          RECENT_COMMITS=$(jq -r '.[] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0]) (@\(.author.login // "unknown"))"' /tmp/recent_commits.json 2>/dev/null | head -10 || echo "No commits")
+          RECENT_PRS=$(jq -r '.[] | "- PR #\(.number): \(.title) (@\(.author.login), merged \(.mergedAt))"' /tmp/recent_prs.json 2>/dev/null || echo "No recent PRs")
+
+          cat > /tmp/user_msg.txt <<ENDOFMSG
+          Generate an incident postmortem for this workflow failure.
+
+          ${PROMPT_TEMPLATE}
+
+          ## Workflow Run Details
+          ${RUN_SUMMARY}
+
+          ## Environment
+          ${ENVIRONMENT}
+
+          ## Failed Jobs/Steps
+          ${FAILED_JOBS}
+
+          ## Recent Commits (potential causes)
+          ${RECENT_COMMITS}
+
+          ## Recent Merged PRs
+          ${RECENT_PRS}
+          ENDOFMSG
+
+          PAYLOAD=$(jq -n \
+            --arg model "$MODEL" \
+            --arg system "$SYSTEM_PROMPT" \
+            --rawfile user /tmp/user_msg.txt \
+            '{
+              model: $model,
+              messages: [
+                {role: "system", content: $system},
+                {role: "user", content: $user}
+              ],
+              max_tokens: 3000,
+              temperature: 0.2
+            }')
+
+          RESPONSE=$(curl -sf https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          POSTMORTEM=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          printf '%s' "$POSTMORTEM" > /tmp/postmortem.md
+          echo "Postmortem generated ($(wc -c < /tmp/postmortem.md) bytes)"
+
+      - name: Create GitHub Issue with postmortem
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.context.outputs.run_id }}
+          ENVIRONMENT: ${{ steps.context.outputs.environment }}
+        run: |
+          set -euo pipefail
+
+          SCAN_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          TITLE="📋 Incident Postmortem: ${ENVIRONMENT} — $(jq -r '.workflow' /tmp/run_summary.json) failure (${SCAN_DATE})"
+
+          # Ensure labels exist
+          gh label create "postmortem" --repo "$REPO" --color "FFA500" --description "Incident postmortem" 2>/dev/null || true
+          gh label create "incident" --repo "$REPO" --color "D93F0B" --description "Production incident" 2>/dev/null || true
+
+          ISSUE_BODY="## Incident Postmortem
+
+          **Workflow Run:** [${RUN_ID}](${{ github.server_url }}/${REPO}/actions/runs/${RUN_ID})
+          **Environment:** \`${ENVIRONMENT}\`
+          **Generated:** ${SCAN_DATE}
+
+          ---
+
+          $(cat /tmp/postmortem.md)"
+
+          gh issue create \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --body "$ISSUE_BODY" \
+            --label "postmortem,incident"
+
+          echo "✅ Postmortem issue created"
+
+      - name: Slack notification (optional)
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.context.outputs.run_id }}
+          ENVIRONMENT: ${{ steps.context.outputs.environment }}
+        run: |
+          set -euo pipefail
+
+          WORKFLOW_NAME=$(jq -r '.workflow' /tmp/run_summary.json)
+          PAYLOAD=$(jq -n \
+            --arg env "$ENVIRONMENT" \
+            --arg workflow "$WORKFLOW_NAME" \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${RUN_ID}" \
+            '{
+              text: "🚨 Incident Postmortem Generated",
+              blocks: [
+                {type: "section", text: {type: "mrkdwn", text: "*🚨 Workflow Failure — Postmortem Generated*"}},
+                {type: "section", fields: [
+                  {type: "mrkdwn", text: "*Environment:* \($env)"},
+                  {type: "mrkdwn", text: "*Workflow:* \($workflow)"},
+                  {type: "mrkdwn", text: "*Run:* <\($url)|View Run>"}
+                ]}
+              ]
+            }')
+
+          curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
