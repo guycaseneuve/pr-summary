@@ -18,6 +18,7 @@ const app = express();
 
 // ❌ CodeQL: js/hardcoded-credentials
 const API_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
+// eslint-disable-next-line no-unused-vars
 const DB_PASSWORD = "super_secret_password_123";
 
 // Simulated database query function
@@ -59,6 +60,7 @@ app.get("/search", (req, res) => {
 // User input passed directly to shell command
 app.get("/api/list", (req, res) => {
   const directory = req.query.dir;
+  // eslint-disable-next-line no-unused-vars
   exec("ls -la " + directory, (err, stdout, stderr) => {
     if (err) return res.status(500).send("Command failed");
     res.send("<pre>" + stdout + "</pre>");

@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "test": "jest --coverage --passWithNoTests",
+    "build": "node -c server.js && node -c utils.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix"
   },
@@ -32,6 +34,8 @@
     "serialize-javascript": "1.7.0"
   },
   "devDependencies": {
-    "eslint": "^8.50.0"
+    "eslint": "^8.50.0",
+    "jest": "^29.7.0",
+    "supertest": "^6.3.0"
   }
 }

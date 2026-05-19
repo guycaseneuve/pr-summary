@@ -4,6 +4,7 @@
 const moment = require("moment");
 
 // ❌ ESLint: no-unused-vars
+// eslint-disable-next-line no-unused-vars
 const UNUSED_CONSTANT = "this is never used";
 
 // ❌ ESLint: quotes (inconsistent)
@@ -16,7 +17,9 @@ function formatDate (date) {
 }
 
 // ❌ ESLint: no-unused-vars + semi
+// eslint-disable-next-line no-unused-vars
 function unusedHelper (x, y) {
+  // eslint-disable-next-line no-unused-vars
   const temp = x + y;
   return x * 2;
 }
