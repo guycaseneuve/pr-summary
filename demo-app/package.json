@@ -8,6 +8,16 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix"
   },
+  "jest": {
+    "testEnvironment": "node",
+    "forceExit": true,
+    "testMatch": [
+      "**/__tests__/**/*.test.js"
+    ],
+    "moduleNameMapper": {
+      "^marked$": "<rootDir>/__mocks__/marked.js"
+    }
+  },
   "dependencies": {
     "axios": "0.21.0",
     "ejs": "2.7.4",
