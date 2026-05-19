@@ -70,6 +70,8 @@ jobs:
   cost-analysis:
     name: Generate Cost Analysis
     runs-on: ubuntu-latest
+    needs: [aggregate]
+    if: always()  # Run even if aggregate fails (will use estimates)
     outputs:
       cost_analysis_path: ${{ steps.generate.outputs.path }}
     steps:
@@ -81,12 +83,31 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Download token usage from current run
+        uses: actions/download-artifact@v4
+        with:
+          name: token-usage
+          path: results/
+        continue-on-error: true
+
       - name: Generate cost analysis tables
         id: generate
         run: |
           set -euo pipefail
           mkdir -p results
-          python .github/scripts/cost_analysis.py --output results/cost-analysis.md
+          
+          # Use actual token data if available
+          if [ -f results/token-usage.json ]; then
+            echo "Using actual token data from current workflow run"
+            python .github/scripts/cost_analysis.py \
+              --output results/cost-analysis.md \
+              --usage-file results/token-usage.json
+          else
+            echo "No token data available, using estimated defaults"
+            python .github/scripts/cost_analysis.py \
+              --output results/cost-analysis.md
+          fi
+          
           echo "path=results/cost-analysis.md" >> "$GITHUB_OUTPUT"
 
       - name: Upload cost analysis artifact
@@ -214,7 +235,7 @@ jobs:
   aggregate:
     name: Aggregate & AI Report
     runs-on: ubuntu-latest
-    needs: [codeql, dependabot-scan, cost-analysis]
+    needs: [codeql, dependabot-scan]
     outputs:
       has_critical: ${{ steps.analyze.outputs.has_critical }}
       has_findings: ${{ steps.analyze.outputs.has_findings }}
