@@ -255,12 +255,6 @@ jobs:
           name: dependabot-json
           path: results/
 
-      - name: Download cost analysis
-        uses: actions/download-artifact@v4
-        with:
-          name: cost-analysis
-          path: results/
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
