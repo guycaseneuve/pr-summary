@@ -1,0 +1,4 @@
+# Python dependencies for GitHub Actions workflows
+# Install with: pip install -r requirements.txt
+
+tiktoken==0.7.0

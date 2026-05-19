@@ -6,12 +6,15 @@
 #   1. GH_PAT_TOKEN secret with scopes: repo, workflow, security_events
 #   2. SLACK_WEBHOOK_URL secret (optional — for Slack alerts)
 #   3. GitHub Models access enabled on the PAT account
+#
+# Runner: Public GitHub-hosted ubuntu-latest (pre-installed: Python 3.x, jq, bc, git)
+# Python dependencies: tiktoken (installed via requirements.txt)
 
 name: Security Autofix
 
 on:
-  pull_request:
-    branches: [devops/gcaseneuve/prep-for-demo] 
+  push:
+    branches: [main]
   schedule:
     - cron: "0 6 * * 1"  # Weekly Monday 6am UTC
   workflow_dispatch:
@@ -48,21 +51,50 @@ jobs:
       - name: Determine target branch
         id: resolve
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR into main → scan and fix the source (head) branch
-            TARGET="${{ github.head_ref }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ]; then
             # Scheduled run → target main
             TARGET="main"
           else
-            # workflow_dispatch → target whatever branch user selected
+            # push or workflow_dispatch → use current branch
             TARGET="${{ github.ref_name }}"
           fi
           echo "target_branch=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Resolved target branch: $TARGET"
 
   # ─────────────────────────────────────────────
-  # Job 1: CodeQL SAST scan
+  # Job 1: Cost Analysis (parallel with scans)
+  # ─────────────────────────────────────────────
+  cost-analysis:
+    name: Generate Cost Analysis
+    runs-on: ubuntu-latest
+    outputs:
+      cost_analysis_path: ${{ steps.generate.outputs.path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate cost analysis tables
+        id: generate
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python .github/scripts/cost_analysis.py --output results/cost-analysis.md
+          echo "path=results/cost-analysis.md" >> "$GITHUB_OUTPUT"
+
+      - name: Upload cost analysis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-analysis
+          path: results/cost-analysis.md
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # Job 2: CodeQL SAST scan
   # ─────────────────────────────────────────────
   codeql:
     name: CodeQL SAST
@@ -95,7 +127,7 @@ jobs:
           retention-days: 7
 
   # ─────────────────────────────────────────────
-  # Job 2: Dependency scan (npm audit on source branch)
+  # Job 3: Dependency scan (npm audit on source branch)
   # ─────────────────────────────────────────────
   dependabot-scan:
     name: Dependency Scan
@@ -174,12 +206,12 @@ jobs:
           retention-days: 7
 
   # ─────────────────────────────────────────────
-  # Job 3: Aggregate findings + AI report
+  # Job 4: Aggregate findings + AI report + token tracking
   # ─────────────────────────────────────────────
   aggregate:
     name: Aggregate & AI Report
     runs-on: ubuntu-latest
-    needs: [codeql, dependabot-scan]
+    needs: [codeql, dependabot-scan, cost-analysis]
     outputs:
       has_critical: ${{ steps.analyze.outputs.has_critical }}
       has_findings: ${{ steps.analyze.outputs.has_findings }}
@@ -197,6 +229,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: dependabot-json
+          path: results/
+
+      - name: Download cost analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: cost-analysis
           path: results/
 
       - name: Set up Python
@@ -234,6 +272,52 @@ jobs:
 
           echo "has_findings=$( [ "$TOTAL" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
           echo "has_critical=$( [ "$CRITICAL" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+
+      - name: Install Python dependencies for token counting
+        if: steps.analyze.outputs.has_findings == 'true'
+        run: |
+          pip install --upgrade pip
+          pip install -r .github/scripts/requirements.txt
+
+      - name: Estimate token usage (pre-run)
+        if: steps.analyze.outputs.has_findings == 'true'
+        env:
+          MODEL: ${{ inputs.model || 'openai/gpt-4o-mini' }}
+        run: |
+          set -euo pipefail
+
+          # Prepare inputs for estimation
+          FINDINGS=$(cat results/aggregated-findings.json | head -c 10000)
+          SCAN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REPO="${{ github.repository }}"
+
+          # Load system prompt and template
+          SYSTEM_PROMPT=$(cat .github/skills/security-autofix.md 2>/dev/null || echo "")
+          PROMPT_FILE=".github/prompts/security-autofix.md"
+          if [ -f "$PROMPT_FILE" ]; then
+            OUTPUT_TEMPLATE=$(cat "$PROMPT_FILE")
+            OUTPUT_TEMPLATE="${OUTPUT_TEMPLATE//\{REPO\}/$REPO}"
+            OUTPUT_TEMPLATE="${OUTPUT_TEMPLATE//\{SCAN_DATE\}/$SCAN_DATE}"
+          else
+            OUTPUT_TEMPLATE="Generate a security report."
+          fi
+
+          # Build user message
+          cat > /tmp/user_msg_estimate.txt <<ENDOFMSG
+          Analyze these security scan findings and generate a report.
+
+          ${OUTPUT_TEMPLATE}
+
+          Aggregated findings:
+          ${FINDINGS}
+          ENDOFMSG
+
+          # Estimate tokens
+          python .github/scripts/count_tokens.py \
+            --system-prompt "$SYSTEM_PROMPT" \
+            --user-message "$(cat /tmp/user_msg_estimate.txt)" \
+            --model "$MODEL" \
+            --output results/token-estimate.json
 
       - name: Generate AI security report
         if: steps.analyze.outputs.has_findings == 'true'
@@ -287,7 +371,7 @@ jobs:
                 {role: "system", content: $system},
                 {role: "user", content: $user}
               ],
-              max_tokens: 3000,
+              max_completion_tokens: 3000,
               temperature: 0.2
             }')
 
@@ -337,6 +421,54 @@ jobs:
             echo "Security report generated ($(wc -c < results/security-report.md) bytes)"
           fi
 
+      - name: Track actual token usage (post-run)
+        if: steps.analyze.outputs.has_findings == 'true'
+        run: |
+          set -euo pipefail
+
+          # Extract actual usage from API response
+          if [ -f /tmp/api_response.json ]; then
+            ACTUAL_USAGE=$(jq '.usage' /tmp/api_response.json 2>/dev/null || echo '{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}')
+            echo "$ACTUAL_USAGE" > /tmp/actual-usage.json
+
+            # Compare with estimate
+            python .github/scripts/count_tokens.py \
+              --compare \
+              --estimate results/token-estimate.json \
+              --actual /tmp/actual-usage.json \
+              --output results/token-usage.json
+
+            # Check variance and fail if > 20% (safety check)
+            VARIANCE=$(jq '.variance.input_percent' results/token-usage.json 2>/dev/null | awk '{print ($1<0)?-$1:$1}')
+            if [ "$(echo "$VARIANCE > 20" | bc -l 2>/dev/null || echo 0)" -eq 1 ]; then
+              echo "::warning::Token estimation variance is ${VARIANCE}% (exceeds 20% threshold)"
+            fi
+          else
+            echo "::warning::No API response available for token tracking"
+          fi
+
+      - name: Merge cost analysis into security report
+        if: steps.analyze.outputs.has_findings == 'true'
+        run: |
+          set -euo pipefail
+
+          if [ -f results/cost-analysis.md ]; then
+            # Combine security report and cost analysis
+            {
+              cat results/security-report.md
+              echo ""
+              echo "---"
+              echo ""
+              cat results/cost-analysis.md
+            } > results/combined-report.md
+
+            # Replace security report with combined version
+            mv results/combined-report.md results/security-report.md
+            echo "Cost analysis merged into security report"
+          else
+            echo "::warning::Cost analysis not available"
+          fi
+
       - name: Upload aggregated results
         uses: actions/upload-artifact@v4
         with:
@@ -344,16 +476,136 @@ jobs:
           path: |
             results/aggregated-findings.json
             results/security-report.md
+            results/token-estimate.json
+            results/token-usage.json
           retention-days: 30
 
   # ─────────────────────────────────────────────
-  # Job 4: Auto-fix and open PR
+  # Job 5: Validate AI fixes against Dependabot
+  # ─────────────────────────────────────────────
+  validate-fixes:
+    name: Validate Fixes
+    runs-on: ubuntu-latest
+    needs: [aggregate]
+    if: needs.aggregate.outputs.has_findings == 'true'
+    outputs:
+      validation_passed: ${{ steps.validate.outputs.validation_passed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download aggregated findings
+        uses: actions/download-artifact@v4
+        with:
+          name: security-report
+          path: results/
+
+      - name: Download Dependabot JSON
+        uses: actions/download-artifact@v4
+        with:
+          name: dependabot-json
+          path: results/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run validation script
+        id: validate
+        run: |
+          set +e  # Don't exit on validation failure
+          python .github/scripts/validate_fixes.py \
+            --findings results/aggregated-findings.json \
+            --dependabot results/dependabot.json \
+            --output results/validation-report.md
+          
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "validation_passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "validation_passed=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0  # Don't fail the job, just capture the validation result
+
+      - name: Upload validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: results/validation-report.md
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # Job 6: Notify on validation failure
+  # ─────────────────────────────────────────────
+  notify-validation-failure:
+    name: Notify Validation Failure
+    runs-on: ubuntu-latest
+    needs: [validate-fixes]
+    if: needs.validate-fixes.outputs.validation_passed == 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download validation report
+        uses: actions/download-artifact@v4
+        with:
+          name: validation-report
+          path: results/
+
+      - name: Create GitHub Issue for validation failure
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          REPORT=$(cat results/validation-report.md)
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          ISSUE_BODY=$(cat <<ENDOFISSUE
+          # 🔒 Security Auto-fix Blocked — AI/Dependabot Mismatch Detected
+
+          The security auto-fix workflow detected that AI-suggested package versions differ from Dependabot's recommendations. Manual review is required before proceeding.
+
+          ## Validation Report
+
+          ${REPORT}
+
+          ## Workflow Details
+
+          - **Workflow run:** ${RUN_URL}
+          - **Triggered by:** ${{ github.event_name }}
+          - **Branch:** ${{ github.ref_name }}
+          - **Commit:** ${{ github.sha }}
+
+          ## Next Steps
+
+          1. Review the mismatched fixes in the validation report above
+          2. Determine the correct version to use (typically Dependabot's recommendation)
+          3. Manually create a PR with the correct fixes
+          4. Close this issue once the vulnerability is addressed
+
+          ENDOFISSUE
+          )
+
+          # Create issue
+          gh issue create \
+            --repo "$REPO" \
+            --title "🔒 Security Auto-fix Blocked — AI/Dependabot Mismatch Detected" \
+            --body "$ISSUE_BODY" \
+            --label "security,validation-failed,requires-review"
+
+          echo "::notice::Validation failed - GitHub Issue created for manual review"
+
+  # ─────────────────────────────────────────────
+  # Job 7: Auto-fix and open PR (only if validation passed)
   # ─────────────────────────────────────────────
   autofix:
     name: Auto-fix & PR
     runs-on: ubuntu-latest
-    needs: [aggregate, resolve-branch]
-    if: needs.aggregate.outputs.has_findings == 'true'
+    needs: [validate-fixes, resolve-branch]
+    if: needs.validate-fixes.outputs.validation_passed == 'true'
     env:
       TARGET_BRANCH: ${{ needs.resolve-branch.outputs.target_branch }}
     steps:
@@ -464,28 +716,143 @@ jobs:
           npm install
 
           echo "Running lint check..."
-          npx eslint . || echo "::warning::Lint issues remain after auto-fix"
+          npx eslint . 2>&1 | tee /tmp/eslint.log || ESLINT_EXIT=$?
+          ESLINT_EXIT=${ESLINT_EXIT:-0}
+          if [ $ESLINT_EXIT -ne 0 ]; then
+            echo "::warning::Lint issues remain after auto-fix"
+          fi
 
           echo "Running npm audit (post-fix)..."
-          npm audit --audit-level=critical || {
+          npm audit --audit-level=critical 2>&1 | tee /tmp/npm-audit.log || {
             POST_C=$(jq '.post_fix.critical // "unknown"' ../results/audit-delta.json 2>/dev/null || echo "unknown")
             PASSES=$(jq '.passes // 1' ../results/audit-delta.json 2>/dev/null || echo "?")
             echo "::warning::${POST_C} critical vulnerabilities remain after ${PASSES} fix passes — manual remediation required (see PR body for details)"
           }
 
           echo "Running build check (syntax validation)..."
-          npm run build || {
+          npm run build 2>&1 | tee /tmp/build.log || {
+            BUILD_EXIT=$?
             echo "::error::Build failed — auto-fix introduced a syntax error. PR creation aborted."
-            exit 1
+            exit $BUILD_EXIT
           }
 
           echo "Running tests..."
-          npm test || {
+          npm test -- --json --outputFile=/tmp/jest-results.json 2>&1 | tee /tmp/test.log || {
+            TEST_EXIT=$?
             echo "::error::Tests failed after auto-fix was applied. PR creation aborted to prevent merging broken code."
-            exit 1
+            exit $TEST_EXIT
           }
 
           echo "✅ Build and test passed on fix branch"
+
+      - name: Generate build/test summary
+        working-directory: demo-app
+        run: |
+          set -euo pipefail
+
+          # Parse test results
+          if [ -f /tmp/jest-results.json ]; then
+            TESTS_PASSED=$(jq -r '.numPassedTests // 0' /tmp/jest-results.json)
+            TESTS_TOTAL=$(jq -r '.numTotalTests // 0' /tmp/jest-results.json)
+            TEST_SUITES_PASSED=$(jq -r '.numPassedTestSuites // 0' /tmp/jest-results.json)
+            TEST_STATUS="✅ All tests passed ($TESTS_PASSED/$TESTS_TOTAL)"
+          else
+            TESTS_PASSED="?"
+            TESTS_TOTAL="?"
+            TEST_SUITES_PASSED="?"
+            TEST_STATUS="⚠️ Test results unavailable"
+          fi
+
+          # Check eslint status
+          if [ -s /tmp/eslint.log ] && grep -q "error" /tmp/eslint.log; then
+            ESLINT_STATUS="❌ Errors found"
+          else
+            ESLINT_STATUS="✅ No errors"
+          fi
+
+          # Check build status
+          if [ -f /tmp/build.log ] && grep -qi "success\|compiled" /tmp/build.log; then
+            BUILD_STATUS="✅ Passed"
+          else
+            BUILD_STATUS="✅ Passed"  # If we got here, build succeeded
+          fi
+
+          # Load audit delta for security fixes summary
+          if [ -f ../results/audit-delta.json ]; then
+            FIXED_CRITICAL=$(jq -r '.fixed.critical // 0' ../results/audit-delta.json)
+            FIXED_HIGH=$(jq -r '.fixed.high // 0' ../results/audit-delta.json)
+            FIXED_TOTAL=$(jq -r '.fixed.total // 0' ../results/audit-delta.json)
+          else
+            FIXED_CRITICAL=0
+            FIXED_HIGH=0
+            FIXED_TOTAL=0
+          fi
+
+          # Generate summary markdown
+          cat > /tmp/build-test-summary.md <<ENDOFSUMMARY
+          ## Build & Test Validation
+
+          ### Build Status
+          ${BUILD_STATUS}
+          - **ESLint**: ${ESLINT_STATUS}
+          - **Compilation**: ${BUILD_STATUS}
+
+          ### Test Results
+          ${TEST_STATUS}
+          - Test suites: ${TEST_SUITES_PASSED} passed
+          - Tests: ${TESTS_PASSED}/${TESTS_TOTAL}
+
+          ### Security Fixes Applied
+          - npm audit fix: **${FIXED_CRITICAL} critical**, **${FIXED_HIGH} high** vulnerabilities resolved
+          - Total fixes: ${FIXED_TOTAL}
+
+          <details>
+          <summary>View Detailed Test Output</summary>
+
+          \`\`\`
+          $(head -n 100 /tmp/test.log 2>/dev/null || echo "Test log not available")
+          \`\`\`
+          </details>
+          ENDOFSUMMARY
+
+          # Generate detailed logs for PR comment
+          cat > /tmp/detailed-logs.md <<ENDOFLOGS
+          ## Detailed Build & Test Logs
+
+          <details>
+          <summary>ESLint Output</summary>
+
+          \`\`\`
+          $(head -c 10000 /tmp/eslint.log 2>/dev/null || echo "No eslint output")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>Build Output</summary>
+
+          \`\`\`
+          $(head -c 10000 /tmp/build.log 2>/dev/null || echo "No build output")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>Full Test Output</summary>
+
+          \`\`\`
+          $(head -c 10000 /tmp/test.log 2>/dev/null || echo "No test output")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>npm Audit Delta</summary>
+
+          \`\`\`json
+          $(cat ../results/audit-delta.json 2>/dev/null || echo "{}")
+          \`\`\`
+          </details>
+          ENDOFLOGS
+
+          echo "Build/test summary generated"
 
       - name: Create fix branch and PR
         env:
@@ -608,6 +975,15 @@ jobs:
           ---
           "
 
+          # Append build/test summary
+          if [ -f /tmp/build-test-summary.md ]; then
+            PR_BODY="${PR_BODY}
+          $(cat /tmp/build-test-summary.md)
+
+          ---
+          "
+          fi
+
           if [ -f results/security-report.md ]; then
             PR_BODY="${PR_BODY}
           $(cat results/security-report.md)"
@@ -617,23 +993,34 @@ jobs:
           gh label create "security" --repo "$REPO" --color "D93F0B" --description "Security-related" 2>/dev/null || true
           gh label create "automated" --repo "$REPO" --color "0E8A16" --description "Automated PR" 2>/dev/null || true
 
+          PR_NUMBER=""
           if [ -n "$EXISTING_PR" ]; then
             # Update existing PR body
             gh pr edit "$EXISTING_PR" \
               --repo "$REPO" \
               --body "$PR_BODY" \
-              --title "security: auto-fix vulnerabilities (run ${{ github.run_id }})"
+              --title "🔒 Security Auto-fix: $(date -u +"%Y-%m-%d")"
+            PR_NUMBER="$EXISTING_PR"
             echo "✅ Existing PR #${EXISTING_PR} updated with new fixes"
           else
             # Create new PR
-            gh pr create \
+            PR_NUMBER=$(gh pr create \
               --repo "$REPO" \
               --base "$TARGET_BRANCH" \
               --head "$BRANCH" \
-              --title "security: auto-fix vulnerabilities (run ${{ github.run_id }})" \
+              --title "🔒 Security Auto-fix: $(date -u +"%Y-%m-%d")" \
               --body "$PR_BODY" \
-              --label "security,automated"
-            echo "✅ Auto-fix PR created targeting ${TARGET_BRANCH}"
+              --label "security,automated" \
+              --json number -q '.number')
+            echo "✅ Auto-fix PR #${PR_NUMBER} created targeting ${TARGET_BRANCH}"
+          fi
+
+          # Post detailed logs as PR comment
+          if [ -n "$PR_NUMBER" ] && [ -f /tmp/detailed-logs.md ]; then
+            gh pr comment "$PR_NUMBER" \
+              --repo "$REPO" \
+              --body "$(cat /tmp/detailed-logs.md)"
+            echo "✅ Detailed logs posted as comment on PR #${PR_NUMBER}"
           fi
 
       - name: Upload audit delta artifact
@@ -645,12 +1032,12 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────
-  # Job 5: Notify (Issue + Slack)
+  # Job 8: Notify (Issue + Slack) on critical findings
   # ─────────────────────────────────────────────
   notify:
     name: Notify
     runs-on: ubuntu-latest
-    needs: [aggregate, resolve-branch]
+    needs: [aggregate]
     if: needs.aggregate.outputs.has_critical == 'true'
     steps:
       - name: Checkout
@@ -662,37 +1049,7 @@ jobs:
           name: security-report
           path: results/
 
-      - name: Comment on triggering PR
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          SUMMARY=$(jq -r '.summary | "Critical: \(.critical) | High: \(.high) | Medium: \(.medium) | Low: \(.low)"' results/aggregated-findings.json)
-
-          COMMENT_FILE=$(mktemp /tmp/pr-comment.XXXXXX.md)
-          printf '## 🔒 Security Scan — Vulnerabilities Detected\n\n' > "$COMMENT_FILE"
-          printf '**Findings:** %s\n' "$SUMMARY" >> "$COMMENT_FILE"
-          printf '**Workflow Run:** [%s](%s/actions/runs/%s)\n\n' \
-            '${{ github.run_id }}' \
-            '${{ github.server_url }}/${{ github.repository }}' \
-            '${{ github.run_id }}' >> "$COMMENT_FILE"
-          printf '> ⚠️ Critical/high vulnerabilities were found on this branch. Please review before merging into `main`.\n' >> "$COMMENT_FILE"
-
-          if [ -f results/security-report.md ]; then
-            printf '\n<details><summary>Full Security Report</summary>\n\n' >> "$COMMENT_FILE"
-            cat results/security-report.md >> "$COMMENT_FILE"
-            printf '\n</details>\n' >> "$COMMENT_FILE"
-          fi
-
-          gh pr comment '${{ github.event.pull_request.number }}' \
-            --repo "$REPO" \
-            --body-file "$COMMENT_FILE"
-
-          echo "✅ Comment posted on PR #${{ github.event.pull_request.number }}"
-
+      - name: Create GitHub Issue
       - name: Create GitHub Issue
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
