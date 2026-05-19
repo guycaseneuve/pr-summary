@@ -1,0 +1,624 @@
+# Security Autofix Pipeline
+# Runs CodeQL SAST + Dependabot SCA, aggregates findings via AI, auto-fixes where possible,
+# and notifies via GitHub Issue + optional Slack.
+#
+# Prerequisites:
+#   1. GH_PAT_TOKEN secret with scopes: repo, workflow, security_events
+#   2. SLACK_WEBHOOK_URL secret (optional — for Slack alerts)
+#   3. GitHub Models access enabled on the PAT account
+
+name: Security Autofix
+
+on:
+  # Triggers disabled — this file is a reference copy of the original workflow.
+  # Active workflow is security-autofix.yml. Both firing simultaneously caused
+  # GitHub Models API rate limiting on the aggregate job.
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "AI model for report generation"
+        required: false
+        default: "openai/gpt-4o-mini"
+        type: choice
+        options:
+          - "openai/gpt-4o-mini"
+          - "openai/gpt-4o"
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+  issues: write
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 0: Resolve target branch
+  # ─────────────────────────────────────────────
+  resolve-branch:
+    name: Resolve Target Branch
+    runs-on: ubuntu-latest
+    outputs:
+      target_branch: ${{ steps.resolve.outputs.target_branch }}
+    steps:
+      - name: Determine target branch
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR into main → scan and fix the source (head) branch
+            TARGET="${{ github.head_ref }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            # Scheduled run → target main
+            TARGET="main"
+          else
+            # workflow_dispatch → target whatever branch user selected
+            TARGET="${{ github.ref_name }}"
+          fi
+          echo "target_branch=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Resolved target branch: $TARGET"
+
+  # ─────────────────────────────────────────────
+  # Job 1: CodeQL SAST scan
+  # ─────────────────────────────────────────────
+  codeql:
+    name: CodeQL SAST
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+          source-root: demo-app
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: results
+          upload: always
+
+      - name: Upload SARIF as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif
+          path: results/*.sarif
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 2: Dependency scan (npm audit on source branch)
+  # ─────────────────────────────────────────────
+  dependabot-scan:
+    name: Dependency Scan
+    runs-on: ubuntu-latest
+    needs: [resolve-branch]
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-branch.outputs.target_branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run npm audit on demo-app
+        working-directory: demo-app
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+
+          echo "Installing dependencies for demo-app..."
+          npm install --ignore-scripts 2>/dev/null || true
+
+          echo "Running npm audit on demo-app (source branch: ${{ needs.resolve-branch.outputs.target_branch }})..."
+
+          # Run npm audit in JSON format; exit code != 0 means vulnerabilities found
+          npm audit --json > /tmp/npm-audit-raw.json 2>/dev/null || true
+
+          # Transform npm audit output into the same schema the aggregate script expects
+          jq '[
+            .vulnerabilities | to_entries[] |
+            {
+              name: .key,
+              severity: .value.severity,
+              range: .value.range,
+              fix_available: (.value.fixAvailable // false),
+              via: [.value.via[] | if type == "object" then {title: .title, url: .url, severity: .severity, cwe: .cwe, cvss_score: .cvss.score} else {title: .} end]
+            }
+          ]' /tmp/npm-audit-raw.json > /tmp/npm-audit-parsed.json 2>/dev/null || echo "[]" > /tmp/npm-audit-parsed.json
+
+          # Convert to Dependabot-compatible format for the aggregate script
+          # Must match GitHub Dependabot API schema expected by aggregate_findings.py:
+          #   - security_advisory.identifiers: [{type: "CVE", value: "CVE-..."}]
+          #   - security_vulnerability.first_patched_version: {identifier: "1.2.3"} or null
+          jq '[.[] | {
+            security_advisory: {
+              summary: (.via[0].title // "Vulnerability in \(.name)"),
+              severity: .severity,
+              identifiers: [.via[] | select(.url) | {type: "CVE", value: (.url | split("/") | last)}],
+              description: (.via[0].title // ""),
+              references: [.via[] | select(.url) | {url: .url}]
+            },
+            security_vulnerability: {
+              severity: .severity,
+              package: {name: .name, ecosystem: "npm"},
+              vulnerable_version_range: .range,
+              first_patched_version: (if .fix_available then {identifier: "latest"} else null end)
+            },
+            state: "open",
+            dependency: {
+              package: {name: .name, ecosystem: "npm"},
+              manifest_path: "demo-app/package.json"
+            }
+          }]' /tmp/npm-audit-parsed.json > ../results/dependabot.json 2>/dev/null || echo "[]" > ../results/dependabot.json
+
+          COUNT=$(jq 'length' ../results/dependabot.json)
+          echo "Found $COUNT vulnerabilities in demo-app on branch ${{ needs.resolve-branch.outputs.target_branch }}"
+
+      - name: Upload dependency scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependabot-json
+          path: results/dependabot.json
+          retention-days: 7
+
+  # ─────────────────────────────────────────────
+  # Job 3: Aggregate findings + AI report
+  # ─────────────────────────────────────────────
+  aggregate:
+    name: Aggregate & AI Report
+    runs-on: ubuntu-latest
+    needs: [codeql, dependabot-scan]
+    outputs:
+      has_critical: ${{ steps.analyze.outputs.has_critical }}
+      has_findings: ${{ steps.analyze.outputs.has_findings }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download CodeQL SARIF
+        uses: actions/download-artifact@v4
+        with:
+          name: codeql-sarif
+          path: results/
+
+      - name: Download Dependabot JSON
+        uses: actions/download-artifact@v4
+        with:
+          name: dependabot-json
+          path: results/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run aggregate script
+        id: analyze
+        run: |
+          set -euo pipefail
+
+          # Find the SARIF file (CodeQL names it dynamically)
+          SARIF_FILE=$(find results -name "*.sarif" -type f | head -1)
+          DEPENDABOT_FILE="results/dependabot.json"
+
+          SARIF_ARG=""
+          if [ -n "$SARIF_FILE" ]; then
+            SARIF_ARG="--sarif $SARIF_FILE"
+          fi
+
+          DEP_ARG=""
+          if [ -f "$DEPENDABOT_FILE" ]; then
+            DEP_ARG="--dependabot $DEPENDABOT_FILE"
+          fi
+
+          python .github/scripts/aggregate_findings.py \
+            $SARIF_ARG \
+            $DEP_ARG \
+            --output results/aggregated-findings.json
+
+          # Set outputs for downstream jobs
+          TOTAL=$(jq '.summary.total' results/aggregated-findings.json)
+          CRITICAL=$(jq '.summary.critical' results/aggregated-findings.json)
+
+          echo "has_findings=$( [ "$TOTAL" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+          echo "has_critical=$( [ "$CRITICAL" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+
+      - name: Generate AI security report
+        if: steps.analyze.outputs.has_findings == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          MODEL: ${{ inputs.model || 'openai/gpt-4o-mini' }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Truncate findings to 10000 chars to stay within model context
+          FINDINGS=$(cat results/aggregated-findings.json | head -c 10000)
+          SCAN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Load skill as system prompt
+          SKILL_FILE=".github/skills/security-autofix.md"
+          if [ -f "$SKILL_FILE" ]; then
+            SYSTEM_PROMPT=$(cat "$SKILL_FILE")
+          else
+            SYSTEM_PROMPT="You are a senior security engineer. Analyze the scan findings and produce a prioritized security report."
+          fi
+
+          # Load prompt template
+          PROMPT_FILE=".github/prompts/security-autofix.md"
+          if [ -f "$PROMPT_FILE" ]; then
+            OUTPUT_TEMPLATE=$(cat "$PROMPT_FILE")
+            OUTPUT_TEMPLATE="${OUTPUT_TEMPLATE//\{REPO\}/$REPO}"
+            OUTPUT_TEMPLATE="${OUTPUT_TEMPLATE//\{SCAN_DATE\}/$SCAN_DATE}"
+          else
+            OUTPUT_TEMPLATE="Generate a security report with: Executive Summary, Findings by Severity, Remediation Priority, Auto-fix Summary."
+          fi
+
+          # Build user message via file to avoid shell quoting issues
+          cat > /tmp/user_msg.txt <<ENDOFMSG
+          Analyze these security scan findings and generate a report.
+
+          ${OUTPUT_TEMPLATE}
+
+          Aggregated findings:
+          ${FINDINGS}
+          ENDOFMSG
+
+          # Call GitHub Models API — use jq --rawfile to safely handle content
+          PAYLOAD=$(jq -n \
+            --arg model "$MODEL" \
+            --arg system "$SYSTEM_PROMPT" \
+            --rawfile user /tmp/user_msg.txt \
+            '{
+              model: $model,
+              messages: [
+                {role: "system", content: $system},
+                {role: "user", content: $user}
+              ],
+              max_tokens: 3000,
+              temperature: 0.2
+            }')
+
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::GitHub Models API returned HTTP $HTTP_CODE"
+            cat /tmp/api_response.json
+            exit 1
+          fi
+
+          REPORT=$(jq -r '.choices[0].message.content' /tmp/api_response.json)
+          printf '%s' "$REPORT" > results/security-report.md
+          echo "Security report generated ($(wc -c < results/security-report.md) bytes)"
+
+      - name: Upload aggregated results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: |
+            results/aggregated-findings.json
+            results/security-report.md
+          retention-days: 30
+
+  # ─────────────────────────────────────────────
+  # Job 4: Auto-fix and open PR
+  # ─────────────────────────────────────────────
+  autofix:
+    name: Auto-fix & PR
+    runs-on: ubuntu-latest
+    needs: [aggregate, resolve-branch]
+    if: needs.aggregate.outputs.has_findings == 'true'
+    env:
+      TARGET_BRANCH: ${{ needs.resolve-branch.outputs.target_branch }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-branch.outputs.target_branch }}
+          token: ${{ secrets.GH_PAT_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download security report
+        uses: actions/download-artifact@v4
+        with:
+          name: security-report
+          path: results/
+
+      - name: Run npm audit fix
+        working-directory: demo-app
+        run: |
+          set -euo pipefail
+          echo "Installing dependencies..."
+          npm install --ignore-scripts 2>/dev/null || true
+
+          echo "Running npm audit fix..."
+          npm audit fix --force 2>&1 | tee /tmp/audit-fix-output.txt || true
+
+          echo "npm audit fix complete"
+
+      - name: Run ESLint fix
+        working-directory: demo-app
+        run: |
+          set -euo pipefail
+          echo "Running eslint --fix..."
+          npx eslint . --fix 2>&1 | tee /tmp/eslint-fix-output.txt || true
+          echo "eslint --fix complete"
+
+      - name: Build and test
+        working-directory: demo-app
+        run: |
+          set -euo pipefail
+          echo "Installing dependencies on fix branch..."
+          npm install
+
+          echo "Running lint check..."
+          npx eslint . || echo "::warning::Lint issues remain after auto-fix"
+
+          echo "Running npm audit (post-fix)..."
+          npm audit --audit-level=critical || echo "::warning::Critical vulnerabilities still present after fix"
+
+          if grep -q '"test"' package.json; then
+            echo "Running tests..."
+            npm test
+          else
+            echo "No test script defined — skipping tests"
+          fi
+
+          echo "✅ Build and test passed on fix branch"
+
+      - name: Create fix branch and PR
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Sanitize target branch name for use in fix branch (replace / with -)
+          SAFE_TARGET=$(echo "$TARGET_BRANCH" | tr '/' '-')
+          BRANCH="security/autofix-${SAFE_TARGET}"
+
+          # Only stage demo-app changes (fixes only, not results/)
+          git add demo-app/
+
+          # Check if there are any staged changes
+          if git diff --cached --quiet; then
+            echo "No auto-fixable changes detected. Skipping PR creation."
+            exit 0
+          fi
+
+          # Generate findings fingerprint to detect new vulnerabilities
+          CURRENT_HASH=$(jq -S '[.findings[] | {rule, file, line}] | sort' results/aggregated-findings.json | sha256sum | awk '{print $1}')
+          echo "Current findings hash: $CURRENT_HASH"
+
+          # Configure git
+          git config user.name "security-autofix[bot]"
+          git config user.email "security-autofix[bot]@users.noreply.github.com"
+
+          # Check for existing open PR targeting the same base branch
+          EXISTING_PR=$(gh pr list --repo "$REPO" \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --label "security,automated" \
+            --state open \
+            --json number -q '.[0].number' 2>/dev/null || echo "")
+
+          # If PR exists, check if findings are the same
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Found existing security PR #${EXISTING_PR}"
+
+            # Compare findings hash from the existing fix branch commit message
+            git fetch origin "$BRANCH" 2>/dev/null || true
+            PREVIOUS_HASH=$(git log "origin/${BRANCH}" -1 --format=%B 2>/dev/null | grep "^Findings-Hash:" | awk '{print $2}' || echo "")
+
+            if [ "$CURRENT_HASH" = "$PREVIOUS_HASH" ]; then
+              echo "No new vulnerabilities detected (hash unchanged). Skipping update."
+              exit 0
+            fi
+
+            echo "New vulnerabilities detected (hash changed). Updating existing PR."
+          fi
+
+          # Create/update branch and commit (only demo-app/ changes)
+          git checkout -B "$BRANCH"
+          git commit -m "security: auto-fix vulnerabilities from scan run ${{ github.run_id }}
+
+          Applied:
+          - npm audit fix (dependency upgrades)
+          - eslint --fix (code style corrections)
+
+          Findings-Hash: ${CURRENT_HASH}"
+
+          git push --force origin "$BRANCH"
+
+          # Build PR body from security report
+          PR_BODY="## Security Auto-fix
+
+          This PR was automatically generated by the security-autofix pipeline.
+
+          **Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Target branch:** \`${TARGET_BRANCH}\`
+
+          ### Changes Applied
+          - \`npm audit fix\` — upgraded vulnerable dependencies
+          - \`eslint --fix\` — corrected code style issues
+
+          ---
+          "
+
+          if [ -f results/security-report.md ]; then
+            PR_BODY="${PR_BODY}
+          $(cat results/security-report.md)"
+          fi
+
+          # Ensure labels exist
+          gh label create "security" --repo "$REPO" --color "D93F0B" --description "Security-related" 2>/dev/null || true
+          gh label create "automated" --repo "$REPO" --color "0E8A16" --description "Automated PR" 2>/dev/null || true
+
+          if [ -n "$EXISTING_PR" ]; then
+            # Update existing PR body
+            gh pr edit "$EXISTING_PR" \
+              --repo "$REPO" \
+              --body "$PR_BODY" \
+              --title "security: auto-fix vulnerabilities (run ${{ github.run_id }})"
+            echo "✅ Existing PR #${EXISTING_PR} updated with new fixes"
+          else
+            # Create new PR
+            gh pr create \
+              --repo "$REPO" \
+              --base "$TARGET_BRANCH" \
+              --head "$BRANCH" \
+              --title "security: auto-fix vulnerabilities (run ${{ github.run_id }})" \
+              --body "$PR_BODY" \
+              --label "security,automated"
+            echo "✅ Auto-fix PR created targeting ${TARGET_BRANCH}"
+          fi
+
+  # ─────────────────────────────────────────────
+  # Job 5: Notify (Issue + Slack)
+  # ─────────────────────────────────────────────
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [aggregate, resolve-branch]
+    if: needs.aggregate.outputs.has_critical == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download security report
+        uses: actions/download-artifact@v4
+        with:
+          name: security-report
+          path: results/
+
+      - name: Comment on triggering PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          SUMMARY=$(jq -r '.summary | "Critical: \(.critical) | High: \(.high) | Medium: \(.medium) | Low: \(.low)"' results/aggregated-findings.json)
+
+          COMMENT="## 🔒 Security Scan — Vulnerabilities Detected
+
+          **Findings:** ${SUMMARY}
+          **Workflow Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          > ⚠️ Critical/high vulnerabilities were found on this branch. Please review before merging into \`main\`.
+          "
+
+          if [ -f results/security-report.md ]; then
+            COMMENT="${COMMENT}
+
+          <details><summary>Full Security Report</summary>
+
+          $(cat results/security-report.md)
+
+          </details>"
+          fi
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "$REPO" \
+            --body "$COMMENT"
+
+          echo "✅ Comment posted on PR #${{ github.event.pull_request.number }}"
+
+      - name: Create GitHub Issue
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          SCAN_DATE=$(date -u +"%Y-%m-%d")
+          TITLE="🔒 Security: Critical findings detected — ${SCAN_DATE}"
+
+          BODY="## Security Scan Alert
+
+          **Critical vulnerabilities detected** in the latest security scan.
+
+          **Workflow Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **Triggered by:** ${{ github.event_name }}
+          **Branch:** ${{ github.ref_name }}
+
+          ---
+          "
+
+          if [ -f results/security-report.md ]; then
+            BODY="${BODY}
+          $(cat results/security-report.md)"
+          fi
+
+          # Ensure labels exist
+          gh label create "security" --repo "$REPO" --color "D93F0B" --description "Security-related" 2>/dev/null || true
+          gh label create "critical" --repo "$REPO" --color "B60205" --description "Critical severity" 2>/dev/null || true
+
+          gh issue create \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "security,critical"
+
+          echo "✅ Security issue created"
+
+      - name: Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          SCAN_DATE=$(date -u +"%Y-%m-%d")
+          SUMMARY=$(jq -r '.summary | "Total: \(.total) | Critical: \(.critical) | High: \(.high) | Medium: \(.medium)"' results/aggregated-findings.json)
+
+          PAYLOAD=$(jq -n \
+            --arg repo "$REPO" \
+            --arg date "$SCAN_DATE" \
+            --arg summary "$SUMMARY" \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              text: "🔒 Security Alert: \($repo)",
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: "*🔒 Security Scan Alert*\n*Repo:* \($repo)\n*Date:* \($date)\n*Findings:* \($summary)"
+                  }
+                },
+                {
+                  type: "actions",
+                  elements: [
+                    {
+                      type: "button",
+                      text: { type: "plain_text", text: "View Run" },
+                      url: $url
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+          echo "✅ Slack notification sent"
