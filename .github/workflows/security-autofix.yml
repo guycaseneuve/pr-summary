@@ -362,8 +362,7 @@ jobs:
                 {role: "system", content: $system},
                 {role: "user", content: $user}
               ],
-              max_completion_tokens: 3000,
-              temperature: 0.2
+              max_completion_tokens: 3000
             }')
 
           # Call GitHub Models API with retry-on-rate-limit (HTTP 429)
