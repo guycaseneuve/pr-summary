@@ -118,6 +118,88 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────
+  # Job: Log token usage to CSV (main branch only)
+  # ─────────────────────────────────────────────
+  log-token-usage:
+    name: Log Token Usage to CSV
+    runs-on: ubuntu-latest
+    needs: [aggregate]
+    if: github.ref_name == 'main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT_TOKEN }}
+
+      - name: Download token usage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: token-usage
+          path: results/
+        continue-on-error: true
+
+      - name: Append token usage to CSV
+        run: |
+          set -euo pipefail
+          CSV_FILE="token-usage-log.csv"
+          USAGE_FILE="results/token-usage.json"
+
+          # Create CSV header if file doesn't exist yet
+          if [ ! -f "$CSV_FILE" ]; then
+            echo "run_id,run_date,model,est_input_tokens,est_completion_tokens,est_total_tokens,est_input_cost,est_output_cost,est_total_cost,act_prompt_tokens,act_completion_tokens,act_total_tokens,act_input_cost,act_output_cost,act_total_cost,variance_input_pct,variance_completion_pct,variance_input_diff,variance_completion_diff" > "$CSV_FILE"
+          fi
+
+          if [ -f "$USAGE_FILE" ]; then
+            RUN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            MODEL="${{ inputs.model || 'openai/gpt-4o-mini' }}"
+            RUN_ID="${{ github.run_id }}"
+
+            jq -r \
+              --arg run_id  "$RUN_ID" \
+              --arg run_date "$RUN_DATE" \
+              --arg model   "$MODEL" \
+              '[$run_id, $run_date, $model,
+                (.estimated.estimated_input    // 0),
+                (.estimated.estimated_completion // 0),
+                (.estimated.total_estimate     // 0),
+                (.estimated.input_cost         // 0),
+                (.estimated.output_cost        // 0),
+                (.estimated.total_cost         // 0),
+                (.actual.prompt_tokens         // 0),
+                (.actual.completion_tokens     // 0),
+                (.actual.total_tokens          // 0),
+                (.actual.input_cost            // 0),
+                (.actual.output_cost           // 0),
+                (.actual.total_cost            // 0),
+                (.variance.input_percent       // 0),
+                (.variance.completion_percent  // 0),
+                (.variance.input_diff          // 0),
+                (.variance.completion_diff     // 0)
+              ] | @csv' "$USAGE_FILE" >> "$CSV_FILE"
+
+            echo "✅ Token usage for run $RUN_ID appended to $CSV_FILE"
+          else
+            echo "::warning::No token-usage.json found — skipping CSV log entry"
+          fi
+
+      - name: Commit and push CSV
+        run: |
+          set -euo pipefail
+          git config user.name "security-autofix[bot]"
+          git config user.email "security-autofix[bot]@users.noreply.github.com"
+          git add token-usage-log.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit (no token data or already logged)"
+          else
+            git pull --rebase origin main
+            git commit -m "chore: log token usage for run ${{ github.run_id }}
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+            git push origin main
+            echo "✅ token-usage-log.csv committed and pushed"
+          fi
+
+  # ─────────────────────────────────────────────
   # Job 2: CodeQL SAST scan
   # ─────────────────────────────────────────────
   codeql:
