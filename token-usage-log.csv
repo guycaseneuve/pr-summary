@@ -1,0 +1,3 @@
+run_id,run_date,model,est_input_tokens,est_completion_tokens,est_total_tokens,est_input_cost,est_output_cost,est_total_cost,act_prompt_tokens,act_completion_tokens,act_total_tokens,act_input_cost,act_output_cost,act_total_cost,variance_input_pct,variance_completion_pct,variance_input_diff,variance_completion_diff
+"26183794231","2026-05-20T19:05:28Z","openai/gpt-4o",3420,3000,6420,0.00855,0.03,0.03855,3406,1623,5029,0.008515,0.01623,0.024745,-0.41,-45.9,-14,-1377
+"26183999250","2026-05-20T19:09:30Z","openai/gpt-4o",3420,3000,6420,0.00855,0.03,0.03855,3406,1765,5171,0.008515,0.01765,0.026165,-0.41,-41.17,-14,-1235
