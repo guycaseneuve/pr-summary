@@ -711,8 +711,10 @@ jobs:
           SAFE_TARGET=$(echo "$TARGET_BRANCH" | tr '/' '-')
           BRANCH="security/autofix-${SAFE_TARGET}"
 
-          # Only stage demo-app changes (fixes only, not results/)
-          git add demo-app/
+          # Only stage modifications to already-tracked files (package.json, package-lock.json,
+          # source files touched by eslint --fix, etc). New/untracked files such as coverage/,
+          # node_modules/, or any other generated artefacts are intentionally excluded.
+          git add -u
 
           # Check if there are any staged changes
           if git diff --cached --quiet; then
