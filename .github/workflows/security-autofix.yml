@@ -464,30 +464,18 @@ jobs:
           git config user.name "security-autofix[bot]"
           git config user.email "security-autofix[bot]@users.noreply.github.com"
 
-          # Unstage everything — only the CSV should be committed
-          git reset HEAD -- . 2>/dev/null || true
-
-          CSV_FILE="token-usage-log.csv"
           USAGE_FILE="results/token-usage.json"
-
           if [ ! -f "$USAGE_FILE" ]; then
             echo "::warning::token-usage.json not found — skipping CSV log"
             exit 0
           fi
 
-          # Create CSV with header if this is the first run
-          if [ ! -f "$CSV_FILE" ]; then
-            echo "run_id,run_date,model,est_input_tokens,est_completion_tokens,est_total_tokens,est_input_cost,est_output_cost,est_total_cost,act_prompt_tokens,act_completion_tokens,act_total_tokens,act_input_cost,act_output_cost,act_total_cost,variance_input_pct,variance_completion_pct,variance_input_diff,variance_completion_diff" > "$CSV_FILE"
-          fi
-
-          RUN_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          MODEL="${{ inputs.model || 'openai/gpt-4o-mini' }}"
-          RUN_ID="${{ github.run_id }}"
-
-          jq -r \
-            --arg run_id   "$RUN_ID" \
-            --arg run_date "$RUN_DATE" \
-            --arg model    "$MODEL" \
+          # Pre-compute the CSV row once from the artifact
+          CSV_HEADER="run_id,run_date,model,est_input_tokens,est_completion_tokens,est_total_tokens,est_input_cost,est_output_cost,est_total_cost,act_prompt_tokens,act_completion_tokens,act_total_tokens,act_input_cost,act_output_cost,act_total_cost,variance_input_pct,variance_completion_pct,variance_input_diff,variance_completion_diff"
+          NEW_ROW=$(jq -r \
+            --arg run_id   "${{ github.run_id }}" \
+            --arg run_date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg model    "${{ inputs.model || 'openai/gpt-4o-mini' }}" \
             '[$run_id, $run_date, $model,
               (.estimated.estimated_input       // 0),
               (.estimated.estimated_completion  // 0),
@@ -505,17 +493,28 @@ jobs:
               (.variance.completion_percent     // 0),
               (.variance.input_diff             // 0),
               (.variance.completion_diff        // 0)
-            ] | @csv' "$USAGE_FILE" >> "$CSV_FILE"
+            ] | @csv' "$USAGE_FILE")
 
-          git add token-usage-log.csv
-          if git diff --cached --quiet; then
-            echo "No CSV changes to commit"
-          else
-            git commit -m "chore: log token usage for run ${RUN_ID}"
-            git pull --rebase origin main
-            git push origin HEAD:main
-            echo "✅ token-usage-log.csv committed and pushed to main"
-          fi
+          # Retry: always reset to latest origin/main before appending + pushing
+          for attempt in 1 2 3 4 5; do
+            echo "Attempt ${attempt}/5..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            CSV_FILE="token-usage-log.csv"
+            [ ! -f "$CSV_FILE" ] && echo "$CSV_HEADER" > "$CSV_FILE"
+            echo "$NEW_ROW" >> "$CSV_FILE"
+
+            git add token-usage-log.csv
+            git commit -m "chore: log token usage for run ${{ github.run_id }}"
+            git push origin HEAD:main && echo "✅ Pushed on attempt ${attempt}" && exit 0
+
+            echo "Push rejected — retrying in ${attempt}s..."
+            sleep "$attempt"
+          done
+
+          echo "::error::Failed to push after 5 attempts"
+          exit 1
 
 
   # ─────────────────────────────────────────────
