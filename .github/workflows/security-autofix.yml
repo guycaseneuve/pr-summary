@@ -514,8 +514,8 @@ jobs:
           else
             git pull --rebase origin main
             git commit -m "chore: log token usage for run ${{ github.run_id }}
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+            
+            Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
             git push origin main
             echo "✅ token-usage-log.csv committed and pushed to main"
           fi
